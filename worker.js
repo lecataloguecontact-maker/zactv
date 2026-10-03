@@ -1,350 +1,482 @@
 const CATALOGS = [
   {
-    name: "Arabia",
-    url: "https://kool.ws/live/catalog/live/channels.json?region=FR&language=fr&sort=trending&filter%5Bgroup%5D=Arabia"
+    group: "Arabia",
+    url: "https://kool.ws/live/catalog/live/channels.json?region=FR&language=fr&sort=trending&filter%5Bgroup%5D=Arabia",
   },
   {
-    name: "France",
-    url: "https://kool.ws/live/catalog/live/channels.json?region=FR&language=fr&sort=trending&filter%5Bgroup%5D=France"
-  }
+    group: "France",
+    url: "https://kool.ws/live/catalog/live/channels.json?region=FR&language=fr&sort=trending&filter%5Bgroup%5D=France",
+  },
+  {
+    group: "United Kingdom",
+    url: "https://kool.ws/live/catalog/live/channels.json?region=FR&language=fr&sort=trending&filter%5Bgroup%5D=United%20Kingdom",
+  },
+  {
+    group: "Spain",
+    url: "https://kool.ws/live/catalog/live/channels.json?region=FR&language=fr&sort=trending&filter%5Bgroup%5D=Spain",
+  },
+  {
+    group: "Poland",
+    url: "https://kool.ws/live/catalog/live/channels.json?region=FR&language=fr&sort=trending&filter%5Bgroup%5D=Poland",
+  },
+  {
+    group: "Portugal",
+    url: "https://kool.ws/live/catalog/live/channels.json?region=FR&language=fr&sort=trending&filter%5Bgroup%5D=Portugal",
+  },
+  {
+    group: "Croatia",
+    url: "https://kool.ws/live/catalog/live/channels.json?region=FR&language=fr&sort=trending&filter%5Bgroup%5D=Croatia",
+  },
 ];
 
 const RESOLVE_URL = "https://kool.ws/live/resolve";
+const PLAY_PREFIX = "https://kool.ws/live/play/";
 
 const CORS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, OPTIONS",
-  "Access-Control-Allow-Headers": "*"
+  "Access-Control-Allow-Headers": "*",
+  "Cache-Control": "no-store",
 };
 
-function response(body, status = 200, contentType = "text/plain; charset=utf-8") {
-  return new Response(body, {
-    status,
-    headers: {
-      ...CORS,
-      "Content-Type": contentType,
-      "Cache-Control": "no-store"
+export default {
+  async fetch(request) {
+    if (request.method === "OPTIONS") {
+      return new Response(null, { headers: CORS });
     }
-  });
-}
 
-async function getCatalog(catalog) {
-  const r = await fetch(catalog.url, {
-    headers: {
-      "Accept": "application/json",
-      "User-Agent": "Mozilla/5.0"
+    const url = new URL(request.url);
+
+    try {
+      if (url.pathname === "/") {
+        return new Response(
+          "ZACTV Worker OK\n\n/playlist.m3u\n/channels.json\n/health",
+          {
+            headers: {
+              ...CORS,
+              "Content-Type": "text/plain; charset=utf-8",
+            },
+          }
+        );
+      }
+
+      if (url.pathname === "/health") {
+        return jsonResponse({
+          ok: true,
+          catalogs: CATALOGS.map(c => c.group),
+          time: new Date().toISOString(),
+        });
+      }
+
+      if (url.pathname === "/channels.json") {
+        const channels = await getChannels();
+
+        return jsonResponse({
+          updated: new Date().toISOString(),
+          count: channels.length,
+          channels,
+        });
+      }
+
+      if (url.pathname === "/playlist.m3u") {
+        const channels = await getChannels();
+
+        return new Response(buildM3U(channels), {
+          headers: {
+            ...CORS,
+            "Content-Type": "audio/x-mpegurl; charset=utf-8",
+            "Content-Disposition": 'inline; filename="zactv.m3u"',
+          },
+        });
+      }
+
+      if (url.pathname === "/stream") {
+        const source = url.searchParams.get("url");
+
+        if (!source) {
+          return new Response("Missing ?url=", {
+            status: 400,
+            headers: CORS,
+          });
+        }
+
+        if (!isAllowedPlayUrl(source)) {
+          return new Response("Invalid stream URL", {
+            status: 403,
+            headers: CORS,
+          });
+        }
+
+        const resolved = await resolveStream(source);
+
+        if (!resolved) {
+          return new Response("Unable to resolve stream", {
+            status: 502,
+            headers: CORS,
+          });
+        }
+
+        return Response.redirect(resolved, 302);
+      }
+
+      return new Response("Not found", {
+        status: 404,
+        headers: CORS,
+      });
+
+    } catch (error) {
+      return jsonResponse(
+        {
+          error: true,
+          message:
+            error instanceof Error
+              ? error.message
+              : String(error),
+        },
+        500
+      );
     }
-  });
+  },
+};
 
-  if (!r.ok) {
-    throw new Error(`${catalog.name}: HTTP ${r.status}`);
+async function getChannels() {
+  const results = await Promise.allSettled(
+    CATALOGS.map(async catalog => {
+      const response = await fetch(catalog.url, {
+        headers: {
+          "User-Agent": "ZACTV-Worker/1.0",
+          "Accept": "application/json",
+        },
+        cf: {
+          cacheTtl: 0,
+          cacheEverything: false,
+        },
+      });
+
+      if (!response.ok) {
+        throw new Error(
+          `${catalog.group}: HTTP ${response.status}`
+        );
+      }
+
+      const data = await response.json();
+
+      const channels = extractChannels(data);
+
+      return channels.map(channel =>
+        normalizeChannel(channel, catalog.group)
+      );
+    })
+  );
+
+  const all = [];
+
+  for (const result of results) {
+    if (result.status === "fulfilled") {
+      all.push(...result.value);
+    }
   }
 
-  return await r.json();
+  return dedupeChannels(all);
 }
 
-function findChannels(data, group, output = []) {
-  if (!data) return output;
-
-  if (Array.isArray(data)) {
-    for (const item of data) {
-      findChannels(item, group, output);
-    }
-    return output;
+function extractChannels(value, depth = 0) {
+  if (depth > 8 || value == null) {
+    return [];
   }
 
-  if (typeof data !== "object") return output;
+  if (Array.isArray(value)) {
+    const direct = value.filter(isChannelObject);
 
-  const playUrl =
-    data.url ||
-    data.play_url ||
-    data.playUrl ||
-    data.link ||
+    if (direct.length) {
+      return direct;
+    }
+
+    let found = [];
+
+    for (const item of value) {
+      found.push(
+        ...extractChannels(item, depth + 1)
+      );
+    }
+
+    return found;
+  }
+
+  if (typeof value !== "object") {
+    return [];
+  }
+
+  for (const key of [
+    "channels",
+    "items",
+    "results",
+    "data",
+    "entries",
+    "content",
+  ]) {
+    if (key in value) {
+      const found = extractChannels(
+        value[key],
+        depth + 1
+      );
+
+      if (found.length) {
+        return found;
+      }
+    }
+  }
+
+  let found = [];
+
+  for (const [key, child] of Object.entries(value)) {
+    if (
+      key !== "metadata" &&
+      key !== "meta" &&
+      key !== "pagination"
+    ) {
+      found.push(
+        ...extractChannels(child, depth + 1)
+      );
+    }
+  }
+
+  return found;
+}
+
+function isChannelObject(obj) {
+  if (
+    !obj ||
+    typeof obj !== "object" ||
+    Array.isArray(obj)
+  ) {
+    return false;
+  }
+
+  const name =
+    obj.name ??
+    obj.title ??
+    obj.channel_name ??
+    obj.displayName ??
+    obj.label;
+
+  const id =
+    obj.id ??
+    obj.channel_id ??
+    obj.channelId;
+
+  const play =
+    obj.url ??
+    obj.play_url ??
+    obj.playUrl ??
+    obj.stream_url ??
+    obj.streamUrl ??
+    obj.href;
+
+  return Boolean(name && (id || play));
+}
+
+function normalizeChannel(channel, group) {
+  const name =
+    channel.name ??
+    channel.title ??
+    channel.channel_name ??
+    channel.displayName ??
+    channel.label ??
+    "Unknown";
+
+  const id =
+    channel.id ??
+    channel.channel_id ??
+    channel.channelId ??
     "";
 
-  if (
-    typeof playUrl === "string" &&
-    /\/live\/play\//.test(playUrl)
-  ) {
-    output.push({
-      name:
-        data.name ||
-        data.title ||
-        data.channel_name ||
-        data.channelName ||
-        "Unknown",
+  const source =
+    channel.url ??
+    channel.play_url ??
+    channel.playUrl ??
+    channel.stream_url ??
+    channel.streamUrl ??
+    channel.href ??
+    "";
 
-      url: playUrl,
+  let playUrl = source;
 
-      logo:
-        data.logo ||
-        data.logo_url ||
-        data.logoUrl ||
-        data.icon ||
-        "",
-
-      group
-    });
-
-    return output;
+  if (id && !isAllowedPlayUrl(playUrl)) {
+    playUrl =
+      `${PLAY_PREFIX}${encodeURIComponent(id)}`;
   }
 
-  for (const value of Object.values(data)) {
-    if (value && typeof value === "object") {
-      findChannels(value, group, output);
+  return {
+    id: String(id || source || name),
+    name: String(name),
+
+    group: String(
+      channel.group ??
+      channel.category ??
+      channel.country ??
+      group
+    ),
+
+    logo: String(
+      channel.logo ??
+      channel.logo_url ??
+      channel.logoUrl ??
+      channel.icon ??
+      ""
+    ),
+
+    url: playUrl,
+  };
+}
+
+function dedupeChannels(channels) {
+  const seen = new Set();
+  const output = [];
+
+  for (const channel of channels) {
+    if (!channel.url) {
+      continue;
     }
+
+    const key =
+      `${channel.name.toLowerCase()}|${channel.url}`;
+
+    if (seen.has(key)) {
+      continue;
+    }
+
+    seen.add(key);
+    output.push(channel);
   }
 
   return output;
 }
 
-async function getChannels() {
-  const all = [];
-
-  for (const catalog of CATALOGS) {
-    try {
-      const data = await getCatalog(catalog);
-
-      const channels = findChannels(
-        data,
-        catalog.name
-      );
-
-      all.push(...channels);
-    } catch (e) {
-      console.log(
-        `Erreur ${catalog.name}: ${e.message}`
-      );
-    }
-  }
-
-  // Supprimer les doublons
-  const seen = new Set();
-
-  return all.filter(channel => {
-    if (!channel.url) return false;
-
-    if (seen.has(channel.url)) {
-      return false;
-    }
-
-    seen.add(channel.url);
-    return true;
-  });
-}
-
-function clean(value) {
-  return String(value || "")
-    .replace(/\r/g, " ")
-    .replace(/\n/g, " ")
-    .replace(/"/g, "'");
-}
-
-async function createPlaylist(request) {
-  const channels = await getChannels();
-
-  const origin = new URL(request.url).origin;
-
-  let m3u = "#EXTM3U\n";
-  m3u += "#PLAYLIST:Arabia + France\n";
+function buildM3U(channels) {
+  const lines = [
+    "#EXTM3U",
+    "#PLAYLIST:ZACTV Arabia + France + UK + Spain + Poland + Portugal + Croatia",
+  ];
 
   for (const channel of channels) {
-    const name = clean(channel.name);
-    const group = clean(channel.group);
+    if (!isAllowedPlayUrl(channel.url)) {
+      continue;
+    }
 
     const logo = channel.logo
-      ? clean(channel.logo)
+      ? ` tvg-logo="${escapeM3U(channel.logo)}"`
       : "";
 
-    const stream =
-      origin +
-      "/stream?url=" +
-      encodeURIComponent(channel.url);
+    const group =
+      escapeM3U(channel.group || "Live");
 
-    m3u +=
-      `#EXTINF:-1 tvg-name="${name}" ` +
-      `tvg-logo="${logo}" ` +
-      `group-title="${group}",${name}\n`;
+    lines.push(
+      `#EXTINF:-1${logo} group-title="${group}",${escapeM3U(channel.name)}`
+    );
 
-    m3u += stream + "\n";
-  }
-
-  return m3u;
-}
-
-async function resolve(url) {
-  const endpoint =
-    RESOLVE_URL +
-    "?region=FR" +
-    "&language=fr" +
-    "&url=" +
-    encodeURIComponent(url);
-
-  const r = await fetch(endpoint, {
-    headers: {
-      "Accept": "application/json",
-      "User-Agent": "Mozilla/5.0"
-    }
-  });
-
-  if (!r.ok) {
-    throw new Error(`Resolve HTTP ${r.status}`);
-  }
-
-  const data = await r.json();
-
-  // Différents formats possibles de réponse
-  return (
-    data.url ||
-    data.stream ||
-    data.stream_url ||
-    data.playlist ||
-    data.hls ||
-    null
-  );
-}
-
-export default {
-  async fetch(request) {
-    const url = new URL(request.url);
-
-    // OPTIONS / CORS
-    if (request.method === "OPTIONS") {
-      return new Response(null, {
-        status: 204,
-        headers: CORS
-      });
-    }
-
-    // Accueil
-    if (url.pathname === "/") {
-      return response(
-        JSON.stringify({
-          status: "online",
-          service: "ZACTV",
-          endpoints: [
-            "/health",
-            "/channels.json",
-            "/playlist.m3u"
-          ]
-        }, null, 2),
-        200,
-        "application/json; charset=utf-8"
-      );
-    }
-
-    // Test
-    if (url.pathname === "/health") {
-      return response(
-        JSON.stringify({
-          status: "ok"
-        }),
-        200,
-        "application/json"
-      );
-    }
-
-    // Liste des chaînes
-    if (url.pathname === "/channels.json") {
-      try {
-        const channels = await getChannels();
-
-        return response(
-          JSON.stringify(channels, null, 2),
-          200,
-          "application/json; charset=utf-8"
-        );
-      } catch (e) {
-        return response(
-          JSON.stringify({
-            error: e.message
-          }),
-          500,
-          "application/json"
-        );
-      }
-    }
-
-    // Playlist M3U
-    if (url.pathname === "/playlist.m3u") {
-      try {
-        const playlist = await createPlaylist(request);
-
-        return response(
-          playlist,
-          200,
-          "application/vnd.apple.mpegurl; charset=utf-8"
-        );
-      } catch (e) {
-        return response(
-          "#EXTM3U\n# ERROR\n",
-          500,
-          "application/vnd.apple.mpegurl"
-        );
-      }
-    }
-
-    // Résolution d'une chaîne
-    if (url.pathname === "/stream") {
-      const playUrl = url.searchParams.get("url");
-
-      if (!playUrl) {
-        return response(
-          JSON.stringify({
-            error: "url manquante"
-          }),
-          400,
-          "application/json"
-        );
-      }
-
-      // Limiter aux URLs de lecture du catalogue
-      if (
-        !playUrl.startsWith(
-          "https://kool.ws/live/play/"
-        ) &&
-        !playUrl.startsWith(
-          "http://kool.ws/live/play/"
-        )
-      ) {
-        return response(
-          JSON.stringify({
-            error: "URL non autorisée"
-          }),
-          400,
-          "application/json"
-        );
-      }
-
-      try {
-        const streamUrl = await resolve(playUrl);
-
-        if (!streamUrl) {
-          throw new Error(
-            "Aucune URL de flux retournée"
-          );
-        }
-
-        return Response.redirect(streamUrl, 302);
-
-      } catch (e) {
-        return response(
-          JSON.stringify({
-            error: "Résolution impossible",
-            details: e.message
-          }),
-          502,
-          "application/json"
-        );
-      }
-    }
-
-    return response(
-      JSON.stringify({
-        error: "Not found"
-      }),
-      404,
-      "application/json"
+    lines.push(
+      `/stream?url=${encodeURIComponent(channel.url)}`
     );
   }
-};
+
+  return lines.join("\n") + "\n";
+}
+
+async function resolveStream(playUrl) {
+  const resolve = new URL(RESOLVE_URL);
+
+  resolve.searchParams.set("region", "FR");
+  resolve.searchParams.set("language", "fr");
+  resolve.searchParams.set("url", playUrl);
+
+  const response = await fetch(
+    resolve.toString(),
+    {
+      headers: {
+        "User-Agent": "ZACTV-Worker/1.0",
+        "Accept": "application/json",
+        "Referer": "https://kool.ws/",
+        "Origin": "https://kool.ws",
+      },
+
+      cf: {
+        cacheTtl: 0,
+        cacheEverything: false,
+      },
+    }
+  );
+
+  if (!response.ok) {
+    return null;
+  }
+
+  const contentType =
+    response.headers.get("content-type") || "";
+
+  if (
+    contentType.includes("application/json")
+  ) {
+    const data = await response.json();
+
+    const resolved =
+      data.url ??
+      data.stream_url ??
+      data.streamUrl ??
+      data.src ??
+      data.source ??
+      data.data?.url ??
+      data.data?.stream_url;
+
+    if (
+      typeof resolved === "string" &&
+      resolved.startsWith("http")
+    ) {
+      return resolved;
+    }
+
+    return null;
+  }
+
+  const text = await response.text();
+
+  const match =
+    text.match(/https?:\/\/[^\s"'<>]+/);
+
+  return match ? match[0] : null;
+}
+
+function isAllowedPlayUrl(value) {
+  try {
+    const u = new URL(value);
+
+    return (
+      u.protocol === "https:" &&
+      u.hostname === "kool.ws" &&
+      u.pathname.startsWith("/live/play/")
+    );
+  } catch {
+    return false;
+  }
+}
+
+function escapeM3U(value) {
+  return String(value)
+    .replace(/&/g, "&amp;")
+    .replace(/"/g, "&quot;")
+    .replace(/\r?\n/g, " ");
+}
+
+function jsonResponse(data, status = 200) {
+  return new Response(
+    JSON.stringify(data, null, 2),
+    {
+      status,
+      headers: {
+        ...CORS,
+        "Content-Type":
+          "application/json; charset=utf-8",
+      },
+    }
+  );
+}
